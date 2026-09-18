@@ -1,0 +1,9 @@
+config.toml
+__pycache__/
+*.py[cod]
+.venv/
+
+# 开发侧内容（不入库，本地保留）
+/docs/
+/tests/
+/tools/

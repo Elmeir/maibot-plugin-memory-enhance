@@ -1,0 +1,29 @@
+# 记忆增强配置参考示例
+# 说明：宿主首次加载会自动生成完整 config.toml；本文件只列出结构骨架，
+#       全部字段的中文说明见 WebUI 各页签。
+
+[plugin]
+enabled = true
+config_version = "0.2.0"     # 勿手改
+
+[sources]                    # 数据源开关（每路独立；全部关闭时工具返回失败提示）
+diaries = true               # 日记（本插件 write_diary 写入的内容，检索时标注 [日记]）
+paragraphs_relations = true  # 段落 + 图谱关系（经宿主 knowledge.search 检索）
+facts = true                 # 事实声明（只读直读 A_Memorix metadata.db 的 fact_claims）
+episodes = false             # 经历/事件（knowledge.search mode=episode，检索较重，默认关）
+
+[search]                     # 检索行为
+cross_scope = "关闭"         # 跨流检索：关闭(默认)/仅群聊(当前流+全部群聊，不含其它私聊)/全部(含私聊)
+
+[tools]                      # 工具接入方式
+replace_builtin = false      # 关=新增 search_memory（默认，自动移除内置 query_memory）；
+                             # 开=query_memory 同名接管（需先关闭宿主内置「启用记忆检索」）
+
+[diary]                      # 日记功能
+enabled = true               # 提供 write_diary 工具（关闭后工具不提供，已记录内容保留）
+
+[host_retrieval]             # 宿主检索参数（只读展示，修改入口见 WebUI 各字段小字说明）
+min_results = 4              # 宿主「最小保留数」：宿主 WebUI「记忆」页 → 高级 修改
+percentile = 75              # 宿主「动态百分位」：改 config/bot_config.toml 后重启
+min_threshold = 0.29         # 同上（配置文件修改）
+max_threshold = 0.95         # 同上（配置文件修改）

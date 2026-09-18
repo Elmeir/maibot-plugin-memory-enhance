@@ -1,0 +1,43 @@
+{
+  "manifest_version": 2,
+  "version": "0.2.0",
+  "id": "github.elmeir.memory-enhance",
+  "name": "记忆增强",
+  "description": "增强版长期记忆检索（跨聊天流 / 事实表 / 日记）+ 模型日记工具；数据源、工具接入方式均可配置。",
+  "author": {
+    "name": "Elmeir",
+    "url": "https://github.com/Elmeir"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/Elmeir/maibot-plugin-memory-enhance",
+    "homepage": "https://github.com/Elmeir/maibot-plugin-memory-enhance",
+    "documentation": "https://github.com/Elmeir/maibot-plugin-memory-enhance#readme",
+    "issues": "https://github.com/Elmeir/maibot-plugin-memory-enhance/issues"
+  },
+  "host_application": {
+    "min_version": "1.2.5",
+    "max_version": "1.2.99"
+  },
+  "sdk": {
+    "min_version": "2.8.1",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "chat.get_group_streams",
+    "config.get",
+    "knowledge.search"
+  ],
+  "plugin_type": "extension",
+  "display": {
+    "icon": {
+      "type": "emoji",
+      "value": "🧠"
+    }
+  },
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": ["zh-CN"]
+  }
+}
