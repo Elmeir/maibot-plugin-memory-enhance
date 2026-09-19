@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "id": "github.elmeir.memory-enhance",
   "name": "记忆增强",
   "description": "增强版长期记忆检索（跨聊天流 / 事实表 / 日记）+ 模型日记工具；数据源、工具接入方式均可配置。",

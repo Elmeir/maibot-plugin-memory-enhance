@@ -84,7 +84,7 @@ git clone https://github.com/Elmeir/maibot-plugin-memory-enhance maibot-plugin-m
 | 动态百分位（`threshold.percentile`） | 75 | WebUI 的配置文件编辑，或手改 `<运行目录>/config/bot_config.toml` 的 `[a_memorix.threshold]`（改后重启） | 调到 **45~55**（阈值更严格） |
 | 最小 / 最大阈值 | 0.29 / 0.95 | 同上 | 一般不用动 |
 
-插件配置页的「宿主检索参数」页签会**只读显示**上述各项的当前值。
+插件配置页的「宿主检索参数」页签会**只读显示**上述各项的当前值。配置页另有「调试」页签：诊断日志开关（检索范围解析 / 群聊流缓存状态）+ 三张「工具信息」卡片（search_memory / query_memory / write_diary 的 LLM 视角定义：可见性 / 描述 / 参数，只读、随插件加载自动刷新）。
 
 ## 工作原理
 

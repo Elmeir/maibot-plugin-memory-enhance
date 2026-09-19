@@ -4,7 +4,7 @@
 
 [plugin]
 enabled = true
-config_version = "0.2.0"     # 勿手改
+config_version = "0.3.0"     # 勿手改
 
 [sources]                    # 数据源开关（每路独立；全部关闭时工具返回失败提示）
 diaries = true               # 日记（本插件 write_diary 写入的内容，检索时标注 [日记]）
@@ -27,3 +27,22 @@ min_results = 4              # 宿主「最小保留数」：宿主 WebUI「记�
 percentile = 75              # 宿主「动态百分位」：改 config/bot_config.toml 后重启
 min_threshold = 0.29         # 同上（配置文件修改）
 max_threshold = 0.95         # 同上（配置文件修改）
+
+[debug]                      # 调试
+enabled = false              # 诊断日志（检索范围解析 / 群聊流缓存状态）
+
+# 以下为调试页「工具信息」只读展示段：内容由插件加载时自动写入（勿手改）
+[tool_search_memory]
+visibility = ""
+description = ""
+parameters = ""
+
+[tool_query_memory]
+visibility = ""
+description = ""
+parameters = ""
+
+[tool_write_diary]
+visibility = ""
+description = ""
+parameters = ""

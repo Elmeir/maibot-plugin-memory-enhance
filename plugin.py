@@ -31,6 +31,7 @@ chat.get_group_streams 枚举（session_id 与记忆归属 key 同源）。
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sqlite3
 import time
@@ -55,7 +56,7 @@ from maibot_sdk.types import (
 
 from .diary import DiaryStore, format_local_time
 
-SUPPORTED_CONFIG_VERSION = "0.2.0"
+SUPPORTED_CONFIG_VERSION = "0.3.0"
 """插件支持的配置版本（plugin.config_version 默认值，宿主据此执行配置迁移）。"""
 
 _CAPABILITY_PREFIX = "你知道这些知识:"
@@ -273,6 +274,183 @@ class HostRetrievalSectionConfig(PluginConfigBase):
     )
 
 
+class DebugSectionConfig(PluginConfigBase):
+    """调试配置。"""
+
+    __ui_label__ = "调试"
+    __ui_icon__ = "terminal"
+    __ui_order__ = 6
+
+    enabled: bool = Field(
+        default=False,
+        description="输出诊断日志（检索范围解析、群聊流缓存状态）",
+        json_schema_extra={
+            "label": "诊断日志",
+            "hint": "开=输出检索范围与群聊流枚举的诊断日志（日志搜「记忆增强·调试」）；排查范围与命中问题时打开",
+        },
+    )
+
+
+class ToolInfoBaseConfig(PluginConfigBase):
+    """工具信息基类（只读展示：LLM 视角的工具定义，加载时自动写入）。
+
+    WebUI 对字段的显示值取自配置值本身（schema.default 会被空配置值覆盖），
+    展示文本由 on_load 写入 config.toml 对应段；读取处忽略这些字段（纯展示）。
+    """
+
+    __ui_icon__ = "wrench"
+    __ui_order__ = 10
+
+    visibility: str = Field(
+        default="",
+        description="工具对 LLM 的可见性（运行时生成，只读）",
+        json_schema_extra={
+            "label": "可见性",
+            "hint": "deferred = 不在常驻工具列表（由 planner 钩子按配置补回 / 可被 tool_search 搜到）",
+            "disabled": True,
+            "rows": 2,
+        },
+    )
+    description: str = Field(
+        default="",
+        description="LLM 看到的工具描述（运行时生成，只读）",
+        json_schema_extra={
+            "label": "描述",
+            "hint": "LLM 实际看到的工具描述；每次插件加载时自动刷新",
+            "disabled": True,
+            "rows": 5,
+        },
+    )
+    parameters: str = Field(
+        default="",
+        description="工具参数清单（运行时生成，只读）",
+        json_schema_extra={
+            "label": "参数",
+            "hint": "每个参数一行：名称（类型，必填/可选）：说明",
+            "disabled": True,
+            "rows": 5,
+        },
+    )
+
+
+class ToolSearchMemoryConfig(ToolInfoBaseConfig):
+    """检索工具（search_memory，默认模式）。"""
+
+    __ui_label__ = "search_memory"
+
+
+class ToolQueryMemoryConfig(ToolInfoBaseConfig):
+    """检索工具（query_memory，替换原生模式）。"""
+
+    __ui_label__ = "query_memory"
+
+
+class ToolWriteDiaryConfig(ToolInfoBaseConfig):
+    """日记工具（write_diary）。"""
+
+    __ui_label__ = "write_diary"
+
+
+def _collect_tool_info(handler: Any) -> Dict[str, str]:
+    """从组件声明生成单个工具的展示字段（可见性 / 描述 / 参数）。"""
+    info = getattr(handler, "__maibot_component_info__", None)
+    if info is None:
+        return {}
+    metadata = getattr(info, "metadata", None)
+    visibility = ""
+    if isinstance(metadata, dict):
+        visibility = str(metadata.get("visibility") or "").strip()
+    description = str(
+        getattr(info, "brief_description", "") or getattr(info, "description", "") or ""
+    ).strip() or "（无描述）"
+    parameters = getattr(info, "parameters", None) or []
+    param_lines: List[str] = []
+    for param in parameters:
+        param_name = str(getattr(param, "name", "") or "")
+        param_type = getattr(param, "param_type", None)
+        type_text = (
+            getattr(param_type, "value", None)
+            or getattr(param_type, "name", None)
+            or "string"
+        )
+        required = "必填" if bool(getattr(param, "required", False)) else "可选"
+        param_desc = str(getattr(param, "description", "") or "")
+        param_lines.append(f"{param_name}（{type_text}，{required}）: {param_desc}")
+    return {
+        "visibility": visibility or "deferred（未显式声明时的宿主默认）",
+        "description": description,
+        "parameters": "\n".join(param_lines) if param_lines else "（无参数）",
+    }
+
+
+def _collect_all_tool_info() -> Dict[str, Dict[str, str]]:
+    """收集全部工具的展示字段（段名 → 字段字典）。"""
+    return {
+        "tool_search_memory": _collect_tool_info(
+            MemoryEnhancePlugin.handle_search_memory
+        ),
+        "tool_query_memory": _collect_tool_info(
+            MemoryEnhancePlugin.handle_query_memory
+        ),
+        "tool_write_diary": _collect_tool_info(MemoryEnhancePlugin.handle_write_diary),
+    }
+
+
+def _sync_component_info_sections(
+    values: Dict[str, Dict[str, Any]], config_path: Optional[Path] = None
+) -> None:
+    """把只读展示字段写入 config.toml 对应段（每段内容有变化才写）。
+
+    实现与 reply-control 一致：段内容完全由本函数管理（整段重写），文本用
+    JSON 转义（TOML 基础字符串兼容）；失败静默（不影响插件运行）。
+    """
+    if not values:
+        return
+    try:
+        target = config_path or (Path(__file__).parent / "config.toml")
+        if not target.exists():
+            return
+        content = target.read_text(encoding="utf-8")
+        original = content
+        for section, fields in values.items():
+            if not fields:
+                continue
+            body = [
+                f"{name} = " + json.dumps(value, ensure_ascii=False)
+                for name, value in fields.items()
+            ]
+            content = _replace_section_body(content, section, body)
+        if content != original:
+            target.write_text(content, encoding="utf-8")
+    except Exception:
+        pass  # 展示同步失败不影响插件运行
+
+
+def _replace_section_body(content: str, section: str, body: List[str]) -> str:
+    """重写 TOML 指定段的段体（段不存在时追加）；内容未变化时原样返回。"""
+    lines = content.splitlines()
+    start: Optional[int] = None
+    end = len(lines)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == f"[{section}]":
+            start = index
+            continue
+        if start is not None and stripped.startswith("[") and stripped.endswith("]"):
+            end = index
+            break
+    trailing = "\n" if content.endswith("\n") else ""
+    if start is None:
+        suffix = "" if content.endswith("\n") else "\n"
+        return f"{content}{suffix}\n[{section}]\n" + "\n".join(body) + "\n"
+    current = [line for line in lines[start + 1 : end] if line.strip()]
+    if current == body:
+        return content  # 未变化：不写盘、不触发配置事件
+    if end >= len(lines):
+        return "\n".join([*lines[: start + 1], *body]) + trailing
+    return "\n".join([*lines[: start + 1], *body, "", *lines[end:]]) + trailing
+
+
 class MemoryEnhanceConfig(PluginConfigBase):
     """插件总配置。"""
 
@@ -283,6 +461,16 @@ class MemoryEnhanceConfig(PluginConfigBase):
     diary: DiarySectionConfig = Field(default_factory=DiarySectionConfig)
     host_retrieval: HostRetrievalSectionConfig = Field(
         default_factory=HostRetrievalSectionConfig
+    )
+    debug: DebugSectionConfig = Field(default_factory=DebugSectionConfig)
+    tool_search_memory: ToolSearchMemoryConfig = Field(
+        default_factory=ToolSearchMemoryConfig
+    )
+    tool_query_memory: ToolQueryMemoryConfig = Field(
+        default_factory=ToolQueryMemoryConfig
+    )
+    tool_write_diary: ToolWriteDiaryConfig = Field(
+        default_factory=ToolWriteDiaryConfig
     )
 
 
@@ -384,6 +572,20 @@ class MemoryEnhancePlugin(MaiBotPlugin):
             except Exception:
                 values[key] = None
         self._host_threshold_values = values
+        # 只读展示：写入配置值（WebUI 对字段的显示值取自配置值本身）
+        self._sync_readonly_sections()
+
+    def _sync_readonly_sections(self) -> None:
+        """把只读展示（工具信息 + 宿主检索参数）写入 config.toml（内容有变化才写）。"""
+        values: Dict[str, Dict[str, Any]] = dict(_collect_all_tool_info())
+        host_values = {
+            key: value
+            for key, value in (self._host_threshold_values or {}).items()
+            if value is not None
+        }
+        if host_values:
+            values["host_retrieval"] = host_values
+        _sync_component_info_sections(values)
 
     # ---------------------------------------------------------- WebUI
 
@@ -404,6 +606,32 @@ class MemoryEnhancePlugin(MaiBotPlugin):
             plugin_description=plugin_description,
             plugin_author=plugin_author,
         )
+        sections = schema.get("sections")
+        if isinstance(sections, dict):
+            sections.pop("plugin", None)
+            schema["layout"] = {
+                "type": "tabs",
+                "tabs": [
+                    {"id": "sources", "title": "数据源", "sections": ["sources"]},
+                    {"id": "search", "title": "检索", "sections": ["search"]},
+                    {
+                        "id": "tools",
+                        "title": "工具与日记",
+                        "sections": ["tools", "diary"],
+                    },
+                    {"id": "host", "title": "宿主参数", "sections": ["host_retrieval"]},
+                    {
+                        "id": "debug",
+                        "title": "调试",
+                        "sections": [
+                            "debug",
+                            "tool_search_memory",
+                            "tool_query_memory",
+                            "tool_write_diary",
+                        ],
+                    },
+                ],
+            }
         try:
             section = (schema.get("sections") or {}).get("host_retrieval") or {}
             fields = section.get("fields") or {}
@@ -413,6 +641,18 @@ class MemoryEnhancePlugin(MaiBotPlugin):
                     field["default"] = value
         except Exception:
             pass
+        # 工具信息卡：字段 default 注入（双保险；框内值由 on_load 写入配置值）
+        for section_name, info_fields in _collect_all_tool_info().items():
+            section = (schema.get("sections") or {}).get(section_name)
+            if not isinstance(section, dict):
+                continue
+            section_fields = section.get("fields")
+            if not isinstance(section_fields, dict):
+                continue
+            for field_name, value in info_fields.items():
+                field = section_fields.get(field_name)
+                if isinstance(field, dict):
+                    field["default"] = value
         return schema
 
     # ---------------------------------------------------------- planner 钩子
@@ -836,6 +1076,10 @@ class MemoryEnhancePlugin(MaiBotPlugin):
                     f"「仅群聊」检索路数超过 {_MAX_SCOPE_ROUTES}，已截断"
                     "（本轮仅覆盖当前流与部分群聊）"
                 )
+        if self.config.debug.enabled:
+            self.ctx.logger.info(
+                f"记忆增强·调试: 范围解析 {cross_scope} → {len(routes)} 路"
+            )
         return routes
 
     async def _group_stream_ids(self) -> List[str]:
@@ -849,6 +1093,11 @@ class MemoryEnhancePlugin(MaiBotPlugin):
             self._group_stream_cache
             and now - self._group_stream_fetched_at < _GROUP_STREAM_CACHE_SECONDS
         ):
+            if self.config.debug.enabled:
+                self.ctx.logger.info(
+                    f"记忆增强·调试: 群聊流列表缓存命中"
+                    f"（{len(self._group_stream_cache)} 条）"
+                )
             return self._group_stream_cache
         try:
             streams = await self.ctx.chat.get_group_streams(_ALL_PLATFORMS)
