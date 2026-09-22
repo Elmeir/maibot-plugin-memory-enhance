@@ -59,6 +59,49 @@ def format_local_time(timestamp: float) -> str:
         return "未知时间"
 
 
+_WEEKDAY_NAMES: Tuple[str, ...] = (
+    "星期一",
+    "星期二",
+    "星期三",
+    "星期四",
+    "星期五",
+    "星期六",
+    "星期日",
+)
+
+
+def format_chinese_date(timestamp: float) -> str:
+    """Unix 时间戳 → 中文日期（``2026年9月22日 星期二``，本地时间）。"""
+    try:
+        local = datetime.fromtimestamp(float(timestamp))
+    except (OverflowError, OSError, ValueError):
+        return "未知日期"
+    return f"{local.year}年{local.month}月{local.day}日 {_WEEKDAY_NAMES[local.weekday()]}"
+
+
+def format_chinese_time(timestamp: float) -> str:
+    """Unix 时间戳 → 口语化时间（``下午4点`` / ``下午4点35分``，本地时间）。"""
+    try:
+        local = datetime.fromtimestamp(float(timestamp))
+    except (OverflowError, OSError, ValueError):
+        return "未知时间"
+    hour, minute = local.hour, local.minute
+    if hour == 0:
+        period, hour12 = "午夜", 12
+    elif hour < 6:
+        period, hour12 = "凌晨", hour
+    elif hour < 12:
+        period, hour12 = "早上", hour
+    elif hour == 12:
+        period, hour12 = "中午", 12
+    elif hour < 18:
+        period, hour12 = "下午", hour - 12
+    else:
+        period, hour12 = "晚上", hour - 12
+    minute_part = f"{minute:02d}分" if minute else ""
+    return f"{period}{hour12}点{minute_part}"
+
+
 class DiaryStore:
     """日记库读写（每次操作短连接；库小、单进程使用，无需连接池）。"""
 
@@ -155,6 +198,68 @@ class DiaryStore:
             matched.append((score, float(row["created_at"] or 0.0), dict(row)))
         matched.sort(key=lambda item: (-item[0], -item[1]))
         return [item[2] for item in matched[: max(1, limit)]]
+
+    def list_by_stream(self, stream_id: str, limit: int) -> List[Dict[str, Any]]:
+        """取某聊天流（+空归属旧条目）的最近日记，时间正序返回（日记回看用）。
+
+        与检索路同款可见语义：本流 + 空归属（旧数据保持可见，孤儿不丢）。
+        取最新 ``limit`` 条后翻转为正序——先写的先展示，符合日记叙事。
+        """
+        clean_stream = str(stream_id or "").strip()
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, content, created_at, stream_id FROM diary_entries "
+                "WHERE stream_id = ? OR stream_id = '' "
+                "ORDER BY created_at DESC LIMIT ?",
+                (clean_stream, max(1, int(limit))),
+            ).fetchall()
+            return [dict(row) for row in reversed(rows)]
+        finally:
+            connection.close()
+
+    def list_all(self, limit: int) -> List[Dict[str, Any]]:
+        """取全库最近日记（跨流），时间正序返回（删除管理用）。
+
+        不同于 ``list_by_stream`` 只取本流（+空归属），本方法不做流过滤，
+        供 /删日记 查看「所有日记」以便跨流删除管理。取最新 ``limit`` 条后
+        翻转为正序。返回的行带 ``stream_id``，便于区分来源流。
+        """
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, content, created_at, stream_id FROM diary_entries "
+                "ORDER BY created_at DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [dict(row) for row in reversed(rows)]
+        finally:
+            connection.close()
+
+    def get_by_id(self, entry_id: int) -> Optional[Dict[str, Any]]:
+        """按编号取单条日记（删除前回显内容用）；不存在返回 None。"""
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT id, content, created_at, stream_id FROM diary_entries "
+                "WHERE id = ?",
+                (int(entry_id),),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            connection.close()
+
+    def delete_by_id(self, entry_id: int) -> bool:
+        """按编号删除一条日记，返回是否存在并已删除。"""
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                "DELETE FROM diary_entries WHERE id = ?", (int(entry_id),)
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
 
     def count(self) -> int:
         """日记总条数（观测与排查用）。"""

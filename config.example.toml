@@ -21,6 +21,8 @@ replace_builtin = false      # 关=新增 search_memory（默认，自动移除�
 
 [diary]                      # 日记功能
 enabled = true               # 提供 write_diary 工具（关闭后工具不提供，已记录内容保留）
+admin_qqs = []               # /日记、/删日记 指令的管理员 QQ（多个用逗号分隔；留空=仅宿主操作员名单有权限）
+notify_context = false       # 开=把「日记被查看」事件注入 LLM 上下文（含用户 /日记 指令原文与正文摘要，planner+replyer 各一次，不入聊天历史），让模型知道自己日记被看过
 
 [host_retrieval]             # 宿主检索参数（只读展示，修改入口见 WebUI 各字段小字说明）
 min_results = 4              # 宿主「最小保留数」：宿主 WebUI「记忆」页 → 高级 修改

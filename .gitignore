@@ -7,3 +7,5 @@ __pycache__/
 /docs/
 /tests/
 /tools/
+/self_test.py
+/.self_test_tmp/

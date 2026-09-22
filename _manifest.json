@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "id": "github.elmeir.memory-enhance",
   "name": "记忆增强",
-  "description": "增强版长期记忆检索（跨聊天流 / 事实表 / 日记）+ 模型日记工具；数据源、工具接入方式均可配置。",
+  "description": "增强版长期记忆检索（跨聊天流 / 事实表 / 日记）+ 模型日记工具与日记指令（/日记 查看当前流、/删日记 跨流列表并删除，无权限静默）；数据源、工具接入方式均可配置。",
   "author": {
     "name": "Elmeir",
     "url": "https://github.com/Elmeir"
@@ -27,7 +27,9 @@
   "capabilities": [
     "chat.get_group_streams",
     "config.get",
-    "knowledge.search"
+    "knowledge.search",
+    "message.get_recent",
+    "send.text"
   ],
   "plugin_type": "extension",
   "display": {

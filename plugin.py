@@ -35,11 +35,14 @@ import json
 import re
 import sqlite3
 import time
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 from maibot_sdk import (
     CONFIG_RELOAD_SCOPE_SELF,
+    Command,
     Field,
     HookHandler,
     MaiBotPlugin,
@@ -54,7 +57,12 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-from .diary import DiaryStore, format_local_time
+from .diary import (
+    DiaryStore,
+    format_chinese_date,
+    format_chinese_time,
+    format_local_time,
+)
 
 SUPPORTED_CONFIG_VERSION = "0.3.0"
 """插件支持的配置版本（plugin.config_version 默认值，宿主据此执行配置迁移）。"""
@@ -87,6 +95,18 @@ _DIARY_DB_FILENAME = "diary.db"
 
 _DIARY_MAX_CHARS = 2000
 """单条日记的内容长度上限（超出截断并提示）。"""
+
+_DIARY_LIST_DEFAULT_LIMIT = 10
+"""「/日记」默认展示条数。"""
+
+_DIARY_LIST_MAX_LIMIT = 50
+"""「/日记」单次展示条数上限（消息长度考虑）。"""
+
+_HOST_OPERATOR_LIST_KEY = "plugin.permission"
+"""宿主操作员名单配置路径（格式如 ``qq:123456789``；与宿主权限判断同源）。"""
+
+_HOST_COMMAND_PERMISSIONS_KEY = "plugin.command_permissions"
+"""宿主单命令放行规则配置路径（键为 ``插件ID.命令名``，值含 allow_users / allow_chats）。"""
 
 _ALL_PLATFORMS = "all_platforms"
 """ctx.chat.get_group_streams 的平台参数：获取所有平台的聊天流（先例：reply-control）。"""
@@ -225,6 +245,22 @@ class DiarySectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "日记工具",
             "hint": "给模型一个 write_diary 工具随时记录想记住的内容（长期保存，检索时以 [日记] 前缀回看）；关闭后工具不再提供，已记录内容保留",
+        },
+    )
+    admin_qqs: List[str] = Field(
+        default_factory=list,
+        description="有权限执行 /日记 与 /删日记 指令的 QQ 号（管理员）",
+        json_schema_extra={
+            "label": "日记指令管理员 QQ",
+            "hint": "填写可执行 /日记、/删日记 的 QQ 号（多个用逗号分隔）。留空则仅宿主操作员名单（plugin.permission）有权限；此处配置相当于给这些 QQ 放行，无权限用户静默不回复",
+        },
+    )
+    notify_context: bool = Field(
+        default=False,
+        description="把「日记被查看」事件注入到 LLM 上下文，让模型知道自己日记被看过",
+        json_schema_extra={
+            "label": "通知 LLM 日记被查看",
+            "hint": "开=每次执行 /日记 后，把“刚才有人查看了你的日记（含条目编号与正文摘要）”作为一条内部参考消息注入到下一条发给模型的请求里；只作用于当次回复，不写入聊天历史。关=不注入，保持现有行为",
         },
     )
 
@@ -493,6 +529,8 @@ class MemoryEnhancePlugin(MaiBotPlugin):
         self._group_stream_cache: List[str] = []
         self._group_stream_fetched_at: float = 0.0
         self._scope_route_truncated: bool = False
+        # 「日记被查看」待注入事件（仅内存、一条；注入到 planner 与 replyer 后即清除）
+        self._diary_view_notify: Optional[Dict[str, Any]] = None
 
     # ---------------------------------------------------------- 生命周期
 
@@ -707,6 +745,35 @@ class MemoryEnhancePlugin(MaiBotPlugin):
                 updated, self.handle_write_diary
             )
             changed = changed or added
+
+        # 日记查看事件注入 planner：让 planner 在决定是否调用检索工具时看到
+        # 「用户刚查看了你的日记 + 指令原文 + 正文摘要」。只注入、不清除事件
+        # （replyer 阶段再注入并清除）；不入聊天历史（临时的 items 改写）。
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if (
+            bool(getattr(self.config.diary, "notify_context", False))
+            and self._diary_view_notify is not None
+        ):
+            event = self._diary_view_notify
+            event_stream = str(event.get("stream_id") or "").strip()
+            if event_stream and session_id == event_stream:
+                items = kwargs.get("items")
+                if isinstance(items, list) and items:
+                    body = self._build_view_notify_text(event)
+                    if body:
+                        updated_items = [self._build_reference_item(body), *items]
+                        changed = True  # 触发 modified_kwargs 返回 items
+                        self.ctx.logger.info(
+                            f"已把日记查看事件注入 planner 请求[session={session_id[:16]}]"
+                        )
+                        return {
+                            "action": "continue",
+                            "modified_kwargs": {
+                                **kwargs,
+                                "tool_definitions": updated,
+                                "items": updated_items,
+                            },
+                        }
 
         if not changed:
             return {"action": "continue"}
@@ -927,6 +994,443 @@ class MemoryEnhancePlugin(MaiBotPlugin):
             "entry_id": entry_id,
             "created_at": created_at,
         }
+
+    # ---------------------------------------------------------- 日记指令（静默权限）
+
+    async def _has_command_permission(
+        self,
+        command_name: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        is_local_operator: bool,
+    ) -> bool:
+        """插件内复刻宿主命令权限判定（判定结果一致，但不回复"没有权限"）。
+
+        宿主对 ``operator`` 命令在权限不足时会固定回复"你没有权限使用此命令"
+        （bot.py 命令分发内联逻辑），插件无法控制该回复行为；因此 /日记 与
+        /删日记 均声明 ``permission="public"``（宿主不拦截、不回复），由本方法
+        在 handler 内自行校验——无权限时静默拦截（拦截流程但不回复任何内容）。
+        判定逻辑与宿主 ``has_command_permission`` 保持一致，并额外放行
+        本插件「日记指令管理员 QQ」（``diary.admin_qqs``）：
+        1) 本地操作员直接放行；
+        2) 日记指令管理员 QQ（``diary.admin_qqs``，纯 QQ 号，仅命中 qq 平台）；
+        3) 操作员名单（``plugin.permission``，格式 ``platform:user_id``，平台
+           前缀小写、user_id 保持原样——openid 等标识符大小写敏感）；
+        4) 单命令放行规则（``plugin.command_permissions``，键 ``插件ID.命令名``，
+           allow_users 命中用户或 allow_chats 命中会话即放行）。
+        配置读取失败时保守判为无权限（静默拒绝，管理指令宁可误拒）。
+        """
+        if bool(is_local_operator):
+            return True
+
+        normalized_platform = str(platform or "").strip().lower()
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_platform or not normalized_user_id:
+            return False
+        scoped_user_id = f"{normalized_platform}:{normalized_user_id}"
+
+        def _normalize_permissions(raw: Any) -> Set[str]:
+            """规范化 ``platform:user_id`` 列表：平台前缀小写、user_id 保持原样。"""
+            normalized: Set[str] = set()
+            if not isinstance(raw, (list, tuple)):
+                return normalized
+            for item in raw:
+                item = str(item or "").strip()
+                if not item:
+                    continue
+                platform_part, _, user_part = item.partition(":")
+                normalized.add(f"{platform_part.strip().lower()}:{user_part.strip()}")
+            return normalized
+
+        # 参考放行一：本插件「日记指令管理员 QQ」名单。
+        # 填写的是 QQ 号（纯数字），只命中 qq 平台；等价于“给这些用户放行日记指令”。
+        try:
+            admin_qqs = getattr(self.config.diary, "admin_qqs", None) or []
+        except Exception:
+            admin_qqs = []
+        admin_qqs = [str(q).strip() for q in admin_qqs if str(q or "").strip()]
+        if admin_qqs and normalized_platform == "qq" and normalized_user_id in admin_qqs:
+            return True
+
+        try:
+            operators_raw = await self.ctx.config.get(_HOST_OPERATOR_LIST_KEY)
+        except Exception:
+            operators_raw = None
+        if scoped_user_id in _normalize_permissions(operators_raw or []):
+            return True
+
+        try:
+            rules_raw = await self.ctx.config.get(_HOST_COMMAND_PERMISSIONS_KEY)
+        except Exception:
+            rules_raw = None
+        rule = rules_raw.get(f"{self.ctx.plugin_id}.{command_name}") if isinstance(
+            rules_raw, dict
+        ) else None
+        if rule is None:
+            return False
+        if isinstance(rule, dict):
+            allow_users = rule.get("allow_users", [])
+            allow_chats = rule.get("allow_chats", [])
+        else:
+            allow_users = []
+            allow_chats = []
+        if scoped_user_id in _normalize_permissions(allow_users or []):
+            return True
+        allowed_chats = {
+            str(chat_id).strip() for chat_id in (allow_chats or []) if chat_id.strip()
+        }
+        return session_id in allowed_chats
+
+    async def _reject_if_no_permission(
+        self,
+        command_name: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        is_local_operator: bool,
+    ) -> bool:
+        """无权限时返回 True（调用方应静默拦截）；有权限返回 False。"""
+        allowed = await self._has_command_permission(
+            command_name,
+            platform,
+            user_id,
+            session_id,
+            is_local_operator,
+        )
+        return not allowed
+
+    def _diary_list_line(self, row: Dict[str, Any]) -> str:
+        """列表辅助行：``#编号 [中文日期 口语时间] 内容``。"""
+        created_at = float(row.get("created_at") or 0.0)
+        return (
+            f"#{row.get('id')} [{format_chinese_date(created_at)} "
+            f"{format_chinese_time(created_at)}] {self._diary_content(row.get('content'))}"
+        )
+
+    async def _fetch_recent_command_text(self, stream_id: str, limit: int = 12) -> str:
+        """取最近原始消息里最后出现的「 /日记 」指令原文（绕过聊天记录过滤）。
+
+        宿主对 planner/replyer 的聊天历史会过滤掉插件指令（/日记）与 send.text
+        发出的列表；为让 LLM 真正「看到」用户指令，这里用 message.get_recent 直读
+        最近原始消息，从中提取最后一条以 /日记 开头的用户指令正文。失败返回空串。
+        """
+        if not stream_id:
+            return ""
+        try:
+            messages = await self.ctx.message.get_recent(stream_id, limit=max(1, limit))
+        except Exception as exc:
+            self.ctx.logger.info(f"读取最近消息失败（{stream_id[:16]}）: {exc}")
+            return ""
+        if not isinstance(messages, list):
+            return ""
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            content = (
+                msg.get("processed_plain_text")
+                or msg.get("plain_text")
+                or msg.get("content")
+                or msg.get("text")
+                or ""
+            )
+            content = str(content).strip()
+            if content.startswith("/日记"):
+                stripped = content.splitlines()[0].strip()
+                return stripped[:120] if stripped else ""
+        return ""
+
+    async def _record_diary_view_notify(
+        self, stream_id: str, rows: List[Dict[str, Any]]
+    ) -> None:
+        """记录「日记被查看」待注入事件（开关开启时由 /日记 异步调用）。
+
+        只记一条（后写覆盖先写）：事件在注入到 LLM 上下文后即清除，重启即失效。
+        事件携带当前流、查看条数、条目编号+正文摘要，以及（可能取到的）用户 /日记
+        指令原文——供 planner 与 replyer 钩子拼成参考消息注入。
+        """
+        command_text = await self._fetch_recent_command_text(stream_id)
+        summaries = [
+            {
+                "id": row.get("id"),
+                "time": format_local_time(row.get("created_at") or 0.0),
+                "content": self._diary_content(row.get("content")),
+            }
+            for row in rows
+        ]
+        self._diary_view_notify = {
+            "stream_id": stream_id,
+            "count": len(rows),
+            "command": command_text,
+            "entries": summaries,
+            "recorded_at": time.time(),
+        }
+        self.ctx.logger.info(
+            f"日记查看事件待注入[session={stream_id[:16]}]：{len(rows)} 条"
+            f"（指令原文{'已取到' if command_text else '未取到'}）"
+        )
+
+    def _render_diary_voice(
+        self, rows: List[Dict[str, Any]],
+    ) -> List[str]:
+        """按「真实日记口吻」渲染多行：同一天的日记只在首条带日期标题，后续只记时间。
+
+        例：``2026年9月22日 星期二 下午4点 内容`` 换行后再写同一天的日记只写
+        ``下午5点 内容``；跨天时重新打印日期标题。``rows`` 需已按时间正序。
+        """
+        lines: List[str] = []
+        last_date: Optional[str] = None
+        for row in rows:
+            created_at = float(row.get("created_at") or 0.0)
+            this_date = format_chinese_date(created_at)
+            if this_date != last_date:
+                lines.append(this_date)
+                last_date = this_date
+            time_part = format_chinese_time(created_at)
+            lines.append(f"{time_part} {self._diary_content(row.get('content'))}")
+        return lines
+
+    @Command(
+        "diary_list",
+        description="查看当前聊天流的模型日记",
+        pattern=r"^/日记(?:\s+(?P<count>\d{1,3}))?\s*$",
+        permission="public",
+    )
+    async def handle_diary_list(
+        self,
+        stream_id: str = "",
+        platform: str = "",
+        user_id: str = "",
+        is_local_operator: bool = False,
+        matched_groups: Optional[Dict[str, str]] = None,
+        **kwargs: Any,
+    ):
+        """``/日记 [条数]``：返回当前聊天流的日记，用真实日记口吻书写。
+
+        仅当前聊天流（含无归属的旧条目），时间正序；无权限时静默拦截不回复。
+        """
+        del kwargs
+        if await self._reject_if_no_permission(
+            "diary_list", platform, user_id, stream_id, is_local_operator
+        ):
+            self.ctx.logger.info("日记查看被静默拦截（无权限）")
+            return True, "", 2
+        try:
+            count = int(
+                (matched_groups or {}).get("count") or _DIARY_LIST_DEFAULT_LIMIT
+            )
+        except (TypeError, ValueError):
+            count = _DIARY_LIST_DEFAULT_LIMIT
+        count = max(1, min(_DIARY_LIST_MAX_LIMIT, count))
+
+        try:
+            store = self._get_diary_store()
+            rows = store.list_by_stream(stream_id, count)
+        except Exception as exc:
+            self.ctx.logger.info(f"日记列表查询失败: {exc}")
+            await self.ctx.send.text(f"日记列表查询失败：{exc}", stream_id)
+            return False, "查询失败", 2
+
+        if not rows:
+            await self.ctx.send.text("这个聊天流还没有写下的日记。", stream_id)
+            return True, "日记库为空", 2
+
+        await self.ctx.send.text("\n".join(self._render_diary_voice(rows)).strip(), stream_id)
+        if self.config.diary.notify_context and stream_id:
+            await self._record_diary_view_notify(stream_id, rows)
+        return True, "已发送日记", 2
+
+    @Command(
+        "diary_delete",
+        description="查看或删除模型日记（不带编号=查看列表，带编号=删除该条）",
+        pattern=r"^/删日记(?:\s+(?P<entry_id>\d{1,9}))?\s*$",
+        permission="public",
+    )
+    async def handle_diary_delete(
+        self,
+        stream_id: str = "",
+        platform: str = "",
+        user_id: str = "",
+        is_local_operator: bool = False,
+        matched_groups: Optional[Dict[str, str]] = None,
+        **kwargs: Any,
+    ):
+        """``/删日记``：返回当前聊天流的日记列表（带编号供下一步删除）。
+
+        ``/删日记 <编号>``：删除指定编号的日记。两条路均需权限，无权限静默。
+        """
+        del kwargs
+        if await self._reject_if_no_permission(
+            "diary_delete", platform, user_id, stream_id, is_local_operator
+        ):
+            self.ctx.logger.info("日记删除被静默拦截（无权限）")
+            return True, "", 2
+
+        raw_id = ((matched_groups or {}).get("entry_id") or "").strip()
+        if not raw_id:
+            return await self._diary_list_for_delete(stream_id)
+
+        try:
+            entry_id = int(raw_id)
+        except (TypeError, ValueError):
+            return await self._diary_list_for_delete(stream_id)
+        if entry_id <= 0:
+            return await self._diary_list_for_delete(stream_id)
+
+        try:
+            store = self._get_diary_store()
+            row = store.get_by_id(entry_id)
+            if row is None:
+                await self.ctx.send.text(
+                    f"未找到编号 #{entry_id} 的日记（可先发送 /删日记 查看列表）。",
+                    stream_id,
+                )
+                return False, "日记不存在", 2
+            if not store.delete_by_id(entry_id):
+                await self.ctx.send.text(
+                    f"删除失败：编号 #{entry_id} 的日记已不存在。", stream_id
+                )
+                return False, "删除失败", 2
+        except Exception as exc:
+            self.ctx.logger.info(f"日记删除失败（#{entry_id}）: {exc}")
+            await self.ctx.send.text(f"日记删除失败：{exc}", stream_id)
+            return False, "删除失败", 2
+
+        self.ctx.logger.info(f"日记已删除（#{entry_id}，操作流 {stream_id or '∅'}）")
+        message = (
+            f"已删除日记 #{entry_id}"
+            f"[{format_local_time(row['created_at'])}]：\n"
+            f"{self._diary_content(row['content'])}"
+        )
+        await self.ctx.send.text(message, stream_id)
+        return True, "已删除日记", 2
+
+    async def _diary_list_for_delete(self, stream_id: str) -> Tuple[bool, str, int]:
+        """``/删日记`` 不带编号时：显示**全部**日记列表（跨流），每条带编号供删除。
+
+        与 /日记（仅当前流）不同，这里列出全库日记以便跨流删除管理；每条标注
+        来源流（stream_id），『当前』即本聊天流，空归属旧条目标注「无归属」。
+        """
+        try:
+            store = self._get_diary_store()
+            rows = store.list_all(_DIARY_LIST_DEFAULT_LIMIT)
+        except Exception as exc:
+            self.ctx.logger.info(f"日记列表查询失败: {exc}")
+            await self.ctx.send.text(f"日记列表查询失败：{exc}", stream_id)
+            return False, "查询失败", 2
+
+        if not rows:
+            await self.ctx.send.text("还没有写下的日记。", stream_id)
+            return True, "日记库为空", 2
+
+        def _origin(row: Dict[str, Any]) -> str:
+            row_stream = str(row.get("stream_id") or "").strip()
+            if not row_stream:
+                return "无归属"
+            return "当前" if row_stream == str(stream_id or "").strip() else row_stream
+
+        lines = []
+        for row in rows:
+            created_at = float(row.get("created_at") or 0.0)
+            prefix = f"#{row.get('id')} [{_origin(row)}]"
+            lines.append(
+                f"{prefix} [{format_chinese_date(created_at)} "
+                f"{format_chinese_time(created_at)}] {self._diary_content(row.get('content'))}"
+            )
+        lines.append("")
+        lines.append("删除指定日记：发送 /删日记 <编号>（如 /删日记 12）")
+        await self.ctx.send.text("\n".join(lines).strip(), stream_id)
+        return True, "已发送日记列表", 2
+
+    @staticmethod
+    def _diary_content(content: Any) -> str:
+        """单条日记正文：多行合并为空格，空内容兜底。"""
+        return " ".join(str(content or "").split()) or "（空内容）"
+
+    # ------------------------------------------------ 日记查看事件注入 LLM 上下文
+
+    def _build_view_notify_text(self, event: Dict[str, Any]) -> str:
+        """把「日记被查看」待注入事件拼成给模型的一段内部参考消息正文。
+
+        仅客观陈述发生了什么，不含任何引导/建议，避免影响模型判断；
+        不带日记编号，只列时间与内容。
+        """
+        count = int(event.get("count") or 0)
+        entries = event.get("entries") or []
+        command = str(event.get("command") or "").strip()
+        lines = [
+            "【系统通知】有人查看了你的日记（仅当前聊天流）：",
+        ]
+        if command:
+            lines.append(f"用户刚发送的指令：{command}")
+        lines.append(f"共 {count} 条日记被查看，时间与内容如下：")
+        for entry in entries:
+            time_str = str(entry.get('time') or '').strip()
+            content = str(entry.get('content') or '').strip() or "（空内容）"
+            lines.append(f"[{time_str}] {content}")
+        return "\n".join(lines)
+
+    def _build_reference_item(self, text: str) -> Dict[str, Any]:
+        """构造一条可注入请求条目的 UserMessageItem 快照（临时、不入历史）。"""
+        return {
+            "item_type": "UserMessageItem",
+            "meta": {
+                "item_id": uuid.uuid4().hex,
+                "logical_turn_id": None,
+                "timestamp": datetime.now().isoformat(),
+            },
+            "parts": [{"type": "text", "text": text}],
+        }
+
+    @HookHandler(
+        "maisaka.replyer.before_model_request",
+        name="inject_diary_view_notify",
+        description="把「日记被查看」事件注入到下一条发给模型的请求（供模型知道自己日记被看过）",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        timeout_ms=3000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_diary_view_notify_before_model_request(
+        self, **kwargs: Any
+    ) -> Dict[str, Any]:
+        """replyer 构造完模型请求后，把待注入的「日记被查看」事件插入请求条目。
+
+        只对开启 ``diary.notify_context`` 且有待注入事件、且目标流匹配时生效；
+        注入后即清除事件（一次性）。请求条目为空或异常时跳过（不注入）。
+        """
+        if not bool(getattr(self.config.diary, "notify_context", False)):
+            return {"action": "continue"}
+
+        event = self._diary_view_notify
+        if not event:
+            return {"action": "continue"}
+
+        try:
+            items = kwargs.get("items")
+            if not isinstance(items, list) or not items:
+                return {"action": "continue"}
+
+            session_id = str(kwargs.get("session_id") or "").strip()
+            event_stream = str(event.get("stream_id") or "").strip()
+            # 事件只注入到“同一个聊天流”的回复，避免跨流误注
+            if event_stream and session_id != event_stream:
+                return {"action": "continue"}
+
+            body = self._build_view_notify_text(event)
+            if not body:
+                return {"action": "continue"}
+
+            reference_item = self._build_reference_item(body)
+            new_items = [reference_item, *items]
+            self._diary_view_notify = None  # 一次性：replyer 阶段消费
+            self.ctx.logger.info(
+                f"已把日记查看事件注入 replyer 请求[session={session_id[:16]}]：{len(event.get('entries') or [])} 条"
+            )
+            return {"action": "continue", "modified_kwargs": {**kwargs, "items": new_items}}
+        except Exception as exc:
+            self.ctx.logger.info(f"日记查看事件注入失败，已跳过: {exc}")
+            return {"action": "continue"}
 
     # ---------------------------------------------------------- 检索主流程
 
